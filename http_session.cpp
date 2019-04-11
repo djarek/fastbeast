@@ -4,7 +4,10 @@
 
 #include <boost/asio/write.hpp>
 #include <boost/beast/core/flat_static_buffer.hpp>
+#include <boost/beast/http/empty_body.hpp>
 #include <boost/beast/http/read.hpp>
+#include <boost/beast/http/span_body.hpp>
+#include <boost/beast/http/write.hpp>
 #include <ufiber/ufiber.hpp>
 
 #include <sys/mman.h>
@@ -20,96 +23,62 @@ namespace beast = boost::beast;
 using error_code = boost::system::error_code;
 using string_view = beast::string_view;
 
+struct monotonic_pool
+{
+    std::array<char, 16384> buf;
+    void* position = buf.data();
+    std::size_t size = buf.size();
+};
+
+template<class T>
+struct monotonic_allocator
+{
+    using value_type = T;
+
+    explicit monotonic_allocator(monotonic_pool& pool)
+      : pool_{&pool}
+    {
+    }
+
+    template<class U>
+    explicit monotonic_allocator(monotonic_allocator<U> const& other)
+      : pool_{other.pool_}
+    {
+    }
+
+    value_type* allocate(std::size_t n)
+    {
+        if (!std::align(
+              alignof(T), sizeof(T) * n, pool_->position, pool_->size))
+            throw std::bad_alloc{};
+        auto p = reinterpret_cast<T*>(pool_->position);
+        auto end = std::next(p, n);
+        pool_->position = end;
+        pool_->size -= sizeof(T) * n;
+        return p;
+    }
+
+    void deallocate(value_type* p, std::size_t n)
+    {
+    }
+
+    template<class U>
+    friend struct monotonic_allocator;
+
+private:
+    monotonic_pool* pool_;
+};
+
+using fields_t = http::basic_fields<monotonic_allocator<char>>;
+using request_t = http::request<http::empty_body, fields_t>;
+using response_t = http::response<http::span_body<char const>, fields_t>;
+using request_parser_t =
+  http::request_parser<http::empty_body, monotonic_allocator<char>>;
+using response_serializer_t =
+  http::response_serializer<http::span_body<char const>, fields_t>;
+
 namespace
 {
-
-struct request
-{
-    int version;
-    http::verb verb;
-    std::string target;
-    bool keep_alive = true;
-};
-
-struct response_header
-{
-    string_view content_type;
-    std::size_t content_length = 0;
-    http::status status;
-    int version;
-    bool keep_alive;
-};
-
-struct lean_parser : http::basic_parser<true>
-{
-    void on_request_impl(http::verb verb,
-                         string_view /*method_str*/,
-                         string_view target,
-                         int version,
-                         error_code& ec) override
-    {
-        if (target.size() >= request_.target.max_size())
-        {
-            ec = http::error::bad_target;
-            return;
-        }
-
-        request_.target = {target.data(), target.size()};
-        request_.version = version;
-        request_.verb = verb;
-    }
-
-    void on_response_impl(int, string_view, int, error_code&) override
-    {
-        __builtin_unreachable();
-    }
-
-    void on_field_impl(http::field /*f*/,
-                       string_view /*name*/,
-                       string_view /*value*/,
-                       error_code&) override
-    {
-    }
-
-    void on_header_impl(error_code& ec) override
-    {
-        ec = {};
-        request_.keep_alive = this->keep_alive();
-    }
-
-    void on_body_init_impl(boost::optional<std::uint64_t> const&,
-                           error_code& ec) override
-    {
-        ec = {};
-    }
-
-    std::size_t on_body_impl(string_view s, error_code&) override
-    {
-        return s.size();
-    }
-
-    void on_chunk_header_impl(std::uint64_t,
-                              string_view,
-                              error_code& ec) override
-    {
-        ec = {};
-    }
-
-    std::size_t on_chunk_body_impl(std::uint64_t,
-                                   string_view s,
-                                   error_code& ec) override
-    {
-        ec = {};
-        return s.size();
-    }
-
-    void on_finish_impl(error_code& ec) override
-    {
-        ec = {};
-    }
-
-    request request_;
-};
 
 beast::string_view
 mime_type(beast::string_view path)
@@ -122,120 +91,71 @@ mime_type(beast::string_view path)
         return path.substr(pos);
     }();
     if (iequals(ext, ".htm"))
-        return "Content-Type: text/html\r\n";
+        return "text/html";
     if (iequals(ext, ".html"))
-        return "Content-Type: text/html\r\n";
+        return "text/html";
     if (iequals(ext, ".php"))
-        return "Content-Type: text/html\r\n";
+        return "text/html";
     if (iequals(ext, ".css"))
-        return "Content-Type: text/css\r\n";
+        return "text/css";
     if (iequals(ext, ".txt"))
-        return "Content-Type: text/plain\r\n";
+        return "text/plain";
     if (iequals(ext, ".js"))
-        return "Content-Type: application/javascript\r\n";
+        return "application/javascript";
     if (iequals(ext, ".json"))
-        return "Content-Type: application/json\r\n";
+        return "application/json";
     if (iequals(ext, ".xml"))
-        return "Content-Type: application/xml\r\n";
+        return "application/xml";
     if (iequals(ext, ".swf"))
-        return "Content-Type: application/x-shockwave-flash\r\n";
+        return "application/x-shockwave-flash";
     if (iequals(ext, ".flv"))
-        return "Content-Type: video/x-flv\r\n";
+        return "video/x-flv";
     if (iequals(ext, ".png"))
-        return "Content-Type: image/png\r\n";
+        return "image/png";
     if (iequals(ext, ".jpe"))
-        return "Content-Type: image/jpeg\r\n";
+        return "image/jpeg";
     if (iequals(ext, ".jpeg"))
-        return "Content-Type: image/jpeg\r\n";
+        return "image/jpeg";
     if (iequals(ext, ".jpg"))
-        return "Content-Type: image/jpeg\r\n";
+        return "image/jpeg";
     if (iequals(ext, ".gif"))
-        return "Content-Type: image/gif\r\n";
+        return "image/gif";
     if (iequals(ext, ".bmp"))
-        return "Content-Type: image/bmp\r\n";
+        return "image/bmp";
     if (iequals(ext, ".ico"))
-        return "Content-Type: image/vnd.microsoft.icon\r\n";
+        return "image/vnd.microsoft.icon";
     if (iequals(ext, ".tiff"))
-        return "Content-Type: image/tiff\r\n";
+        return "image/tiff";
     if (iequals(ext, ".tif"))
-        return "Content-Type: image/tiff\r\n";
+        return "image/tiff";
     if (iequals(ext, ".svg"))
-        return "Content-Type: image/svg+xml\r\n";
+        return "image/svg+xml";
     if (iequals(ext, ".svgz"))
-        return "Content-Type: image/svg+xml\r\n";
-    return "Content-Type: application/text\r\n";
-}
-
-template<std::size_t N>
-net::const_buffer
-strbuf(char const (&b)[N])
-{
-    return net::const_buffer{b, N - 1};
-}
-
-void
-send_response(socket_t& s,
-              response_header const& h,
-              net::const_buffer body,
-              yield_t& yield)
-{
-    beast::static_string<32> resp_line;
-
-    switch (h.version)
-    {
-        case 10:
-            resp_line += "HTTP/1.0 ";
-            break;
-        case 11:
-            resp_line += "HTTP/1.1 ";
-            break;
-    }
-
-    resp_line += beast::to_static_string(static_cast<std::uint64_t>(h.status));
-    resp_line += ' ';
-    resp_line += http::obsolete_reason(h.status);
-    resp_line += "\r\n";
-
-    auto const len_str =
-      beast::to_static_string(static_cast<std::uint64_t>(h.content_length));
-
-    net::const_buffer keep_alive;
-    if (h.keep_alive)
-        keep_alive = strbuf("Connection: keep-alive\r\n");
-    else
-        keep_alive = strbuf("Connection: close\r\n");
-
-    std::array<net::const_buffer, 8> buffers{
-      net::const_buffer{resp_line.data(), resp_line.size()},
-      strbuf("Server: FastBeast\r\n"),
-      net::const_buffer{h.content_type.data(), h.content_type.size()},
-      keep_alive,
-      strbuf("Content-Length: "),
-      net::const_buffer{len_str.data(), len_str.size()},
-      strbuf("\r\n\r\n"),
-      body};
-    if (auto [ec, n] = net::async_write(s, buffers, yield); ec)
-    {
-        error_log() << "HTTP response write error: " << ec.message();
-        return;
-    }
+        return "image/svg+xml";
+    return "application/text";
 }
 
 void
 send_error_response(socket_t& s,
-                    request const& r,
+                    request_t const& r,
                     http::status status,
-                    string_view resp,
+                    string_view body,
                     yield_t& yield)
 {
-    response_header h;
-    h.status = status;
-    h.content_length = resp.length();
-    h.content_type = "Content-Type: application/text\r\n";
-    h.keep_alive = r.keep_alive;
-    h.version = r.version;
+    response_t resp{std::piecewise_construct,
+                    std::make_tuple(),
+                    std::make_tuple(r.get_allocator())};
+    auto& h = resp.base();
+    h.set(http::field::content_type, "application/text");
+    h.set(http::field::server, "FastBeast");
+    h.set(http::field::keep_alive, "keep-alive");
+    h.result(http::status::ok);
+    resp.body() = http::span_body<char const>::value_type{body};
+    resp.prepare_payload();
 
-    send_response(s, h, net::const_buffer(resp.data(), resp.size()), yield);
+    response_serializer_t serializer{resp};
+    if (auto [ec, n] = http::async_write(s, serializer, yield); ec)
+        error_log() << "Write error: " << ec.message();
 }
 
 struct mmaped_file
@@ -329,10 +249,11 @@ private:
 };
 
 void
-send_file_response(socket_t& s, request const& r, yield_t& yield)
+send_file_response(socket_t& s, request_t const& r, yield_t& yield)
 {
-    if (r.target.empty() || r.target[0] != '/' ||
-        r.target.find("..") != std::string::npos)
+    auto target = r.target();
+    if (target.empty() || target[0] != '/' ||
+        target.find("..") != std::string::npos)
     {
         send_error_response(
           s, r, http::status::not_found, "File not found\r\n", yield);
@@ -341,7 +262,7 @@ send_file_response(socket_t& s, request const& r, yield_t& yield)
 
     thread_local static file_cache cache;
 
-    auto* file = cache.get(r.target);
+    auto* file = cache.get(std::string{target});
     if (file == nullptr)
     {
         send_error_response(
@@ -349,20 +270,27 @@ send_file_response(socket_t& s, request const& r, yield_t& yield)
         return;
     }
 
-    response_header h;
-    h.status = http::status::ok;
-    h.content_length = file->size();
-    h.content_type = mime_type(r.target);
-    h.keep_alive = r.keep_alive;
-    h.version = r.version;
+    response_t resp{std::piecewise_construct,
+                    std::make_tuple(),
+                    std::make_tuple(r.get_allocator())};
+    auto& h = resp.base();
+    h.set(http::field::content_type, mime_type(r.target()));
+    h.set(http::field::server, "FastBeast");
+    h.set(http::field::keep_alive, "keep-alive");
+    resp.result(http::status::ok);
+    resp.body() = http::span_body<char const>::value_type{
+      static_cast<char const*>(file->data()), file->size()};
+    resp.prepare_payload();
 
-    send_response(s, h, net::const_buffer{file->data(), file->size()}, yield);
+    response_serializer_t serializer{resp};
+    if (auto [ec, n] = http::async_write(s, serializer, yield); ec)
+        error_log() << "Write error: " << ec.message();
 }
 
 void
-process_request(socket_t& s, request const& req, yield_t& yield)
+process_request(socket_t& s, request_t const& req, yield_t& yield)
 {
-    switch (req.verb)
+    switch (req.method())
     {
         case http::verb::get:
             send_file_response(s, req, yield);
@@ -392,9 +320,12 @@ spawn_http_session(socket_t&& sock)
 
           while (true)
           {
-              lean_parser parser;
-              parser.body_limit(0);
-
+              monotonic_pool pool;
+              request_parser_t parser{
+                std::piecewise_construct,
+                std::make_tuple(),
+                std::make_tuple(monotonic_allocator<char>{pool})};
+              parser.header_limit(8192);
               if (auto [ec, n] = http::async_read(sock, buffer, parser, yield);
                   ec)
               {
@@ -403,7 +334,12 @@ spawn_http_session(socket_t&& sock)
                   break;
               }
 
-              process_request(sock, parser.request_, yield);
+              process_request(sock, parser.release(), yield);
+              if (!parser.keep_alive())
+              {
+                  sock.close();
+                  return;
+              }
           }
       });
 }
