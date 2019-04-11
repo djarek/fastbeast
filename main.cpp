@@ -1,15 +1,16 @@
 #include "http_session.hpp"
 #include "log.hpp"
-#include "recycling_stack_allocator.hpp"
 
 #include <boost/asio/basic_socket_acceptor.hpp>
 #include <boost/asio/io_context.hpp>
-#include <ufiber/ufiber.hpp>
+#include <boost/beast/core/bind_handler.hpp>
 
 #include <algorithm>
 #include <thread>
 
 namespace fastbeast
+{
+namespace
 {
 
 struct reuse_port
@@ -46,27 +47,38 @@ struct reuse_port
     int value_;
 };
 
-using yield_t = ufiber::yield_token<net::io_context::executor_type>;
+struct acceptor_context
+{
+    static void accept(std::unique_ptr<acceptor_context>&& p,
+                       boost::system::error_code const& ec = {})
+    {
+        auto& self = *p;
+        if (ec)
+        {
+            error_log() << "Accept error: " << ec.message();
+            return;
+        }
+
+        spawn_http_session(std::move(self.socket));
+
+        self.acceptor.async_accept(
+          self.socket, boost::beast::bind_front_handler(&accept, std::move(p)));
+    }
+
+    explicit acceptor_context(acceptor_t&& a)
+      : acceptor{std::move(a)}
+    {
+    }
+
+    acceptor_t acceptor;
+    socket_t socket{acceptor.get_executor()};
+};
 
 void
-accept(acceptor_t&& a, std::function<void(socket_t&& sock)> fn)
+accept(acceptor_t&& a)
 {
-    ufiber::spawn(
-      std::allocator_arg,
-      recycling_stack_allocator<boost::context::fixedsize_stack>{},
-      a.get_executor(),
-      [a = std::move(a), fn = std::move(fn)](yield_t yield) mutable {
-          socket_t socket{a.get_executor()};
-          while (true)
-          {
-              if (auto ec = a.async_accept(socket, yield); ec)
-              {
-                  error_log() << "Accept error: " << ec.message();
-                  break;
-              }
-              fn(std::move(socket));
-          }
-      });
+    auto p = std::make_unique<acceptor_context>(std::move(a));
+    p->accept(std::move(p));
 }
 
 acceptor_t
@@ -90,20 +102,19 @@ run()
     std::generate_n(std::back_inserter(threads), threads.capacity(), [&]() {
         return std::thread{[addr]() {
             net::io_context io{1};
-            fastbeast::accept(fastbeast::make_acceptor(io, addr, 8080),
-                              &spawn_http_session);
+            fastbeast::accept(fastbeast::make_acceptor(io, addr, 8080));
             io.run();
         }};
     });
 
     net::io_context main{1};
-    fastbeast::accept(fastbeast::make_acceptor(main, addr, 8080),
-                      &spawn_http_session);
+    fastbeast::accept(fastbeast::make_acceptor(main, addr, 8080));
     main.run();
     for (auto& t : threads)
         t.join();
 }
 
+} // namespace
 } // namespace fastbeast
 
 int

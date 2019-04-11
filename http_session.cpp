@@ -1,6 +1,5 @@
 #include "http_session.hpp"
 #include "log.hpp"
-#include "recycling_stack_allocator.hpp"
 
 #include <boost/asio/write.hpp>
 #include <boost/beast/core/flat_static_buffer.hpp>
@@ -8,7 +7,7 @@
 #include <boost/beast/http/read.hpp>
 #include <boost/beast/http/span_body.hpp>
 #include <boost/beast/http/write.hpp>
-#include <ufiber/ufiber.hpp>
+#include <boost/intrusive/list.hpp>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -16,7 +15,6 @@
 
 namespace fastbeast
 {
-using yield_t = ufiber::yield_token<net::io_context::executor_type>;
 
 namespace http = boost::beast::http;
 namespace beast = boost::beast;
@@ -25,6 +23,12 @@ using string_view = beast::string_view;
 
 struct monotonic_pool
 {
+    void reset()
+    {
+        position = buf.data();
+        size = buf.size();
+    }
+
     std::array<char, 16384> buf;
     void* position = buf.data();
     std::size_t size = buf.size();
@@ -135,29 +139,6 @@ mime_type(beast::string_view path)
     return "application/text";
 }
 
-void
-send_error_response(socket_t& s,
-                    request_t const& r,
-                    http::status status,
-                    string_view body,
-                    yield_t& yield)
-{
-    response_t resp{std::piecewise_construct,
-                    std::make_tuple(),
-                    std::make_tuple(r.get_allocator())};
-    auto& h = resp.base();
-    h.set(http::field::content_type, "application/text");
-    h.set(http::field::server, "FastBeast");
-    h.set(http::field::keep_alive, "keep-alive");
-    h.result(http::status::ok);
-    resp.body() = http::span_body<char const>::value_type{body};
-    resp.prepare_payload();
-
-    response_serializer_t serializer{resp};
-    if (auto [ec, n] = http::async_write(s, serializer, yield); ec)
-        error_log() << "Write error: " << ec.message();
-}
-
 struct mmaped_file
 {
     static mmaped_file open(char const* path, error_code& ec)
@@ -248,100 +229,194 @@ private:
     std::unordered_map<std::string, mmaped_file> files_;
 };
 
-void
-send_file_response(socket_t& s, request_t const& r, yield_t& yield)
+template<std::size_t N>
+struct node_pool
 {
-    auto target = r.target();
-    if (target.empty() || target[0] != '/' ||
-        target.find("..") != std::string::npos)
+    node_pool() = default;
+    node_pool(node_pool&&) = delete;
+    node_pool& operator=(node_pool&&) = delete;
+
+    void* allocate()
     {
-        send_error_response(
-          s, r, http::status::not_found, "File not found\r\n", yield);
-        return;
+        if (pool_.empty())
+            return ::operator new(N);
+        else
+        {
+            auto* p = &pool_.back();
+            pool_.pop_back();
+            p->~list_base_hook();
+            return p;
+        }
     }
 
-    thread_local static file_cache cache;
-
-    auto* file = cache.get(std::string{target});
-    if (file == nullptr)
+    void deallocate(void* p)
     {
-        send_error_response(
-          s, r, http::status::not_found, "File not found\r\n", yield);
-        return;
+        pool_.push_back(*::new (p) boost::intrusive::list_base_hook<>{});
     }
 
-    response_t resp{std::piecewise_construct,
-                    std::make_tuple(),
-                    std::make_tuple(r.get_allocator())};
-    auto& h = resp.base();
-    h.set(http::field::content_type, mime_type(r.target()));
-    h.set(http::field::server, "FastBeast");
-    h.set(http::field::keep_alive, "keep-alive");
-    resp.result(http::status::ok);
-    resp.body() = http::span_body<char const>::value_type{
-      static_cast<char const*>(file->data()), file->size()};
-    resp.prepare_payload();
+    ~node_pool()
+    {
+        pool_.clear_and_dispose([](auto* p) { ::operator delete(p); });
+    }
 
-    response_serializer_t serializer{resp};
-    if (auto [ec, n] = http::async_write(s, serializer, yield); ec)
-        error_log() << "Write error: " << ec.message();
+    boost::intrusive::list<boost::intrusive::list_base_hook<>> pool_;
+};
+
+struct session
+{
+    static void* operator new(std::size_t n);
+    static void operator delete(void*);
+
+    explicit session(socket_t&& s)
+      : socket{std::move(s)}
+    {
+    }
+
+    static void read(std::unique_ptr<session>&& p,
+                     error_code ec = {},
+                     std::size_t n = 0)
+    {
+        auto& self = *p;
+        if (ec)
+        {
+            self.socket.close();
+            return;
+        }
+
+        self.parser.reset();
+        self.serializer.reset();
+        self.pool.reset();
+        self.parser.emplace(
+          std::piecewise_construct,
+          std::make_tuple(),
+          std::make_tuple(monotonic_allocator<char>{self.pool}));
+        http::async_read(
+          self.socket,
+          self.buffer,
+          *self.parser,
+          beast::bind_front_handler(&process_request, std::move(p)));
+    }
+
+    static void send_error_response(std::unique_ptr<session>&& p,
+                                    request_t const& req,
+                                    http::status status,
+                                    string_view body)
+    {
+        auto& self = *p;
+        auto& response =
+          self.response.emplace(std::piecewise_construct,
+                                std::make_tuple(),
+                                std::make_tuple(req.get_allocator()));
+        auto& h = response.base();
+        h.set(http::field::content_type, "application/text");
+        h.set(http::field::server, "FastBeast");
+        h.set(http::field::keep_alive, "keep-alive");
+        h.result(status);
+        response.body() = http::span_body<char const>::value_type{body};
+        response.prepare_payload();
+        auto& serializer = self.serializer.emplace(response);
+
+        http::async_write(self.socket,
+                          *self.serializer,
+                          beast::bind_front_handler(&read, std::move(p)));
+    }
+
+    static void send_file_response(std::unique_ptr<session>&& p,
+                                   request_t const& req)
+    {
+        auto& self = *p;
+        auto target = req.target();
+        if (target.empty() || target[0] != '/' ||
+            target.find("..") != std::string::npos)
+            return send_error_response(
+              std::move(p), req, http::status::not_found, "File not found\r\n");
+
+        thread_local static file_cache cache;
+
+        auto* file = cache.get(std::string{target});
+        if (file == nullptr)
+            return send_error_response(
+              std::move(p), req, http::status::not_found, "File not found\r\n");
+
+        auto& response =
+          self.response.emplace(std::piecewise_construct,
+                                std::make_tuple(),
+                                std::make_tuple(req.get_allocator()));
+
+        auto& h = response.base();
+        h.set(http::field::content_type, mime_type(target));
+        h.set(http::field::server, "FastBeast");
+        h.set(http::field::keep_alive, "keep-alive");
+        response.result(http::status::ok);
+        response.body() = http::span_body<char const>::value_type{
+          static_cast<char const*>(file->data()), file->size()};
+        response.prepare_payload();
+
+        auto& serializer = self.serializer.emplace(response);
+
+        http::async_write(self.socket,
+                          *self.serializer,
+                          beast::bind_front_handler(&read, std::move(p)));
+    }
+
+    static void process_request(std::unique_ptr<session>&& p,
+                                error_code ec = {},
+                                std::size_t n = 0)
+    {
+        auto& self = *p;
+        if (ec)
+        {
+            self.socket.close();
+            return;
+        }
+
+        auto const& req = self.parser->get();
+        switch (req.method())
+        {
+            case http::verb::get:
+                send_file_response(std::move(p), req);
+                break;
+            default:
+            {
+                send_error_response(std::move(p),
+                                    req,
+                                    http::status::bad_request,
+                                    "Invalid request-method\r\n");
+                break;
+            }
+        }
+    }
+
+    socket_t socket;
+    std::optional<request_parser_t> parser;
+    std::optional<response_t> response;
+    std::optional<response_serializer_t> serializer;
+    monotonic_pool pool;
+    beast::flat_static_buffer<16384> buffer;
+};
+
+thread_local node_pool<sizeof(session)> session_pool;
+
+void*
+session::operator new(std::size_t n)
+{
+    if (n > sizeof(session))
+        throw std::bad_alloc{};
+    return session_pool.allocate();
 }
 
 void
-process_request(socket_t& s, request_t const& req, yield_t& yield)
+session::operator delete(void* p)
 {
-    switch (req.method())
-    {
-        case http::verb::get:
-            send_file_response(s, req, yield);
-            break;
-        default:
-        {
-            send_error_response(s,
-                                req,
-                                http::status::bad_request,
-                                "Invalid request-method\r\n",
-                                yield);
-            break;
-        }
-    }
+    session_pool.deallocate(p);
 }
 
 } // namespace
 void
 spawn_http_session(socket_t&& sock)
 {
-    ufiber::spawn(
-      std::allocator_arg,
-      recycling_stack_allocator<boost::context::fixedsize_stack>{},
-      sock.get_executor(),
-      [sock = std::move(sock)](yield_t yield) mutable {
-          beast::flat_static_buffer<16384> buffer;
-
-          while (true)
-          {
-              monotonic_pool pool;
-              request_parser_t parser{
-                std::piecewise_construct,
-                std::make_tuple(),
-                std::make_tuple(monotonic_allocator<char>{pool})};
-              parser.header_limit(8192);
-              if (auto [ec, n] = http::async_read(sock, buffer, parser, yield);
-                  ec)
-              {
-                  error_log() << "HTTP read error: " << ec.message();
-                  sock.close(ec);
-                  break;
-              }
-
-              process_request(sock, parser.release(), yield);
-              if (!parser.keep_alive())
-              {
-                  sock.close();
-                  return;
-              }
-          }
-      });
+    auto p = std::make_unique<session>(std::move(sock));
+    session::read(std::move(p));
 }
 
 } // namespace fastbeast
