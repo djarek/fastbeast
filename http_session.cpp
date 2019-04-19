@@ -1,12 +1,13 @@
 #include "http_session.hpp"
 #include "log.hpp"
 
+#include "experimental_serializer.hpp"
+
 #include <boost/asio/write.hpp>
 #include <boost/beast/core/flat_static_buffer.hpp>
 #include <boost/beast/http/empty_body.hpp>
 #include <boost/beast/http/read.hpp>
 #include <boost/beast/http/span_body.hpp>
-#include <boost/beast/http/write.hpp>
 #include <boost/intrusive/list.hpp>
 
 #include <sys/mman.h>
@@ -45,10 +46,16 @@ struct monotonic_allocator
     }
 
     template<class U>
-    explicit monotonic_allocator(monotonic_allocator<U> const& other)
+    monotonic_allocator(monotonic_allocator<U> const& other)
       : pool_{other.pool_}
     {
     }
+
+    template<class U>
+    struct rebind
+    {
+        using other = monotonic_allocator<U>;
+    };
 
     value_type* allocate(std::size_t n)
     {
@@ -78,8 +85,8 @@ using request_t = http::request<http::empty_body, fields_t>;
 using response_t = http::response<http::span_body<char const>, fields_t>;
 using request_parser_t =
   http::request_parser<http::empty_body, monotonic_allocator<char>>;
-using response_serializer_t =
-  http::response_serializer<http::span_body<char const>, fields_t>;
+using response_serializer_t = fastbeast::
+  serializer<false, http::span_body<char const>, monotonic_allocator<char>>;
 
 namespace
 {
@@ -316,9 +323,7 @@ struct session
         response.prepare_payload();
         auto& serializer = self.serializer.emplace(response);
 
-        http::async_write(self.socket,
-                          *self.serializer,
-                          beast::bind_front_handler(&read, std::move(p)));
+        write(std::move(p));
     }
 
     static void send_file_response(std::unique_ptr<session>&& p,
@@ -354,9 +359,35 @@ struct session
 
         auto& serializer = self.serializer.emplace(response);
 
-        http::async_write(self.socket,
-                          *self.serializer,
-                          beast::bind_front_handler(&read, std::move(p)));
+        write(std::move(p));
+    }
+
+    static void write(std::unique_ptr<session>&& p,
+                      error_code ec = {},
+                      std::size_t n = 0)
+    {
+        auto& self = *p;
+        if (ec)
+        {
+            self.socket.close();
+            error_log() << "Write error: " << ec.message();
+            return;
+        }
+
+        self.serializer->consume(n);
+
+        auto buffers = self.serializer->next();
+        if (std::all_of(
+              buffers.begin(), buffers.end(), [](net::const_buffer const& b) {
+                  return b.size() == 0;
+              }))
+        {
+            read(std::move(p));
+            return;
+        }
+        net::async_write(self.socket,
+                         buffers,
+                         beast::bind_front_handler(&write, std::move(p)));
     }
 
     static void process_request(std::unique_ptr<session>&& p,
